@@ -239,7 +239,30 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_detalle_prof
                 ON detalle_factura(profesional);
             """)
-        # Admin por defecto
+        # Migraciones: agregar columnas nuevas si no existen
+        migraciones = [
+            "ALTER TABLE facturas ADD COLUMN IF NOT EXISTS nro_factura VARCHAR(30) DEFAULT ''",
+            "ALTER TABLE facturas ADD COLUMN IF NOT EXISTS obra_cuit VARCHAR(30) DEFAULT ''",
+            "ALTER TABLE detalle_factura ADD COLUMN IF NOT EXISTS nro_socio VARCHAR(50)",
+            "ALTER TABLE detalle_factura ADD COLUMN IF NOT EXISTS resp_fiscal VARCHAR(100)",
+            "ALTER TABLE detalle_factura ADD COLUMN IF NOT EXISTS exento NUMERIC DEFAULT 0",
+            "ALTER TABLE detalle_factura ADD COLUMN IF NOT EXISTS gravado NUMERIC DEFAULT 0",
+            "ALTER TABLE detalle_factura ADD COLUMN IF NOT EXISTS facturado NUMERIC DEFAULT 0",
+            "ALTER TABLE detalle_factura ADD COLUMN IF NOT EXISTS iva NUMERIC DEFAULT 0",
+            "ALTER TABLE detalle_factura ADD COLUMN IF NOT EXISTS debitado NUMERIC DEFAULT 0",
+            "ALTER TABLE detalle_factura ADD COLUMN IF NOT EXISTS total_cobrar NUMERIC DEFAULT 0",
+            "ALTER TABLE detalle_factura ADD COLUMN IF NOT EXISTS honorarios NUMERIC DEFAULT 0",
+            "ALTER TABLE detalle_factura ADD COLUMN IF NOT EXISTS gastos NUMERIC DEFAULT 0",
+            "ALTER TABLE detalle_factura ADD COLUMN IF NOT EXISTS coseguro NUMERIC DEFAULT 0",
+            # Renombrar tabla nros_arca → comprobantes si existe la vieja
+            """DO $$ BEGIN
+               IF EXISTS (SELECT FROM information_schema.tables WHERE table_name='nros_arca')
+                  AND NOT EXISTS (SELECT FROM information_schema.tables WHERE table_name='comprobantes')
+               THEN ALTER TABLE nros_arca RENAME TO comprobantes; END IF; END $$""",
+        ]
+        with conn.cursor() as cur:
+            for sql_m in migraciones:
+                cur.execute(sql_m)
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM usuarios WHERE username='admin'")
             if not cur.fetchone():
