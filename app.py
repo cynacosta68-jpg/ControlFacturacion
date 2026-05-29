@@ -392,6 +392,20 @@ def upsert_comprobante(detalle_id: int, nro_arca: str, estado: str):
                               updated_at=NOW()
             """, (detalle_id, nro_arca, estado))
 
+def editar_factura(factura_id: int, nro_factura: str, obra_social: str, periodo: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE facturas SET nro_factura=%s, obra_social=%s, periodo=%s WHERE id=%s",
+                (nro_factura.strip(), obra_social.strip(), periodo.strip(), factura_id)
+            )
+
+def eliminar_factura(factura_id: int):
+    """Elimina la factura y todo su detalle (CASCADE)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM facturas WHERE id=%s", (factura_id,))
+
 def eliminar_comprobante(detalle_id: int):
     """Resetea el comprobante a vacío / Pendiente (no elimina la fila del detalle)."""
     with get_conn() as conn:
@@ -598,22 +612,6 @@ def pantalla_resumen(user):
         limit=limit if limit else None,
     )
 
-    # ── Descarga resumen Excel ────────────────────────────────────────────
-    col_dl, _ = st.columns([2, 5])
-    with col_dl:
-        if st.button("Descargar Excel del resumen", use_container_width=True):
-            excel = exportar_excel_resumen(
-                obra_social=None if os_sel=="Todas" else os_sel,
-                periodo=None if per_sel=="Todos" else per_sel,
-            )
-            st.download_button(
-                "📥 Confirmar descarga",
-                data=excel,
-                file_name=f"resumen_facturacion.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-
     st.markdown("---")
 
     if not facturas:
@@ -622,6 +620,98 @@ def pantalla_resumen(user):
 
     st.markdown('<div class="section-title">Facturas del Colegio Médico</div>', unsafe_allow_html=True)
 
+    # ── Selectores de facturas para descarga ─────────────────────────────
+    def _label_fac(f):
+        nro = f["nro_factura"] or f"ID-{f['id']}"
+        return f"{nro}  ·  {f['obra_social']}  ·  {f['periodo']}"
+
+    opciones_fac = {_label_fac(f): f["id"] for f in facturas}
+
+    sel_key = "sel_facturas_dl"
+    if sel_key not in st.session_state:
+        st.session_state[sel_key] = []
+
+    with st.expander("📥 Seleccionar facturas para descargar en Excel", expanded=False):
+        col_sel_a, col_sel_b = st.columns([1, 1])
+        with col_sel_a:
+            if st.button("Seleccionar todas", use_container_width=True):
+                st.session_state[sel_key] = list(opciones_fac.keys())
+                st.rerun()
+        with col_sel_b:
+            if st.button("Deseleccionar todas", use_container_width=True):
+                st.session_state[sel_key] = []
+                st.rerun()
+
+        seleccionadas = st.multiselect(
+            "Facturas",
+            options=list(opciones_fac.keys()),
+            default=st.session_state[sel_key],
+            label_visibility="collapsed",
+            key="ms_facturas",
+        )
+        st.session_state[sel_key] = seleccionadas
+
+        if seleccionadas:
+            ids_sel = [opciones_fac[s] for s in seleccionadas]
+            st.markdown(
+                f'<div style="font-size:.72rem;color:#388bfd;margin-top:4px">'
+                f'{len(ids_sel)} factura{"s" if len(ids_sel)!=1 else ""} seleccionada{"s" if len(ids_sel)!=1 else ""}</div>',
+                unsafe_allow_html=True,
+            )
+
+            # Generar Excel de las seleccionadas
+            rows_dl = []
+            for fid in ids_sel:
+                filas_dl = obtener_detalle(fid)
+                with get_conn() as conn:
+                    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                        cur.execute("SELECT nro_factura,obra_social,periodo FROM facturas WHERE id=%s", (fid,))
+                        fac_dl = cur.fetchone()
+                for r in filas_dl:
+                    rows_dl.append({
+                        "Nro Factura":    fac_dl["nro_factura"],
+                        "Obra Social":    fac_dl["obra_social"],
+                        "Período":        fac_dl["periodo"],
+                        "Profesional":    r["profesional"],
+                        "Matrícula":      r["matricula"],
+                        "Nro Socio":      r["nro_socio"],
+                        "Resp. Fiscal":   r["resp_fiscal"],
+                        "Exento":         r["exento"],
+                        "Gravado":        r["gravado"],
+                        "Facturado":      r["facturado"],
+                        "IVA":            r["iva"],
+                        "Debitado":       r["debitado"],
+                        "Total a Cobrar": r["total_cobrar"],
+                        "Honorarios":     r["honorarios"],
+                        "Gastos":         r["gastos"],
+                        "Coseguro":       r["coseguro"],
+                        "Nro ARCA":       r["nro_arca"],
+                        "Estado":         r["estado"],
+                    })
+
+            df_dl = pd.DataFrame(rows_dl)
+            buf_dl = io.BytesIO()
+            with pd.ExcelWriter(buf_dl, engine="openpyxl") as writer:
+                df_dl.to_excel(writer, index=False, sheet_name="Facturas seleccionadas")
+            buf_dl.seek(0)
+
+            nombre_archivo = (
+                f"facturas_{seleccionadas[0].split('·')[0].strip().replace(' ','_')}.xlsx"
+                if len(seleccionadas)==1
+                else f"facturas_seleccionadas_{len(seleccionadas)}.xlsx"
+            )
+            st.download_button(
+                f"📥 Descargar {len(ids_sel)} factura{'s' if len(ids_sel)!=1 else ''} en Excel",
+                data=buf_dl.getvalue(),
+                file_name=nombre_archivo,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                type="primary",
+            )
+        else:
+            st.caption("Seleccioná al menos una factura para habilitar la descarga.")
+
+    st.markdown("---")
     for f in facturas:
         total   = int(f["total_profesionales"] or 0)
         compl   = int(f["completos"] or 0)
@@ -630,8 +720,13 @@ def pantalla_resumen(user):
         pct     = compl/total if total else 0
         color   = "#238636" if pct==1 else "#388bfd" if pct>0 else "#484f58"
         fecha   = f["fecha_upload"].strftime("%d/%m/%Y") if f["fecha_upload"] else ""
+        fid     = f["id"]
 
-        col_info, col_btn = st.columns([8, 1])
+        edit_fac_key    = f"edit_fac_{fid}"
+        confirm_del_key = f"confirm_del_{fid}"
+
+        col_info, col_btns = st.columns([7, 2])
+
         with col_info:
             st.markdown(f"""
             <div class="fc-card">
@@ -663,12 +758,67 @@ def pantalla_resumen(user):
               </div>
             </div>
             """, unsafe_allow_html=True)
-        with col_btn:
-            st.markdown("<br><br>", unsafe_allow_html=True)
-            if st.button("Detalle →", key=f"det_{f['id']}", use_container_width=True):
-                st.session_state["factura_sel"] = f["id"]
-                st.session_state["pantalla"]    = "detalle"
-                st.rerun()
+
+        with col_btns:
+            st.markdown("<br>", unsafe_allow_html=True)
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                if st.button("→", key=f"det_{fid}", help="Ver detalle", use_container_width=True):
+                    st.session_state["factura_sel"] = fid
+                    st.session_state["pantalla"]    = "detalle"
+                    st.rerun()
+            with b2:
+                if st.button("✏", key=f"edit_btn_{fid}", help="Modificar factura", use_container_width=True):
+                    st.session_state[edit_fac_key]    = not st.session_state.get(edit_fac_key, False)
+                    st.session_state[confirm_del_key] = False
+                    st.rerun()
+            with b3:
+                if st.button("🗑", key=f"del_btn_{fid}", help="Eliminar factura", use_container_width=True):
+                    st.session_state[confirm_del_key] = not st.session_state.get(confirm_del_key, False)
+                    st.session_state[edit_fac_key]    = False
+                    st.rerun()
+
+        # ── Panel edición inline ──────────────────────────────────────────
+        if st.session_state.get(edit_fac_key, False):
+            with st.container():
+                st.markdown(f'<div style="background:#0d1117;border:1px solid #388bfd;border-radius:6px;padding:12px 16px;margin:-4px 0 8px 0">', unsafe_allow_html=True)
+                ea, eb, ec, ed = st.columns([2, 3, 2, 1])
+                with ea:
+                    st.markdown('<p class="lbl">Nro Factura</p>', unsafe_allow_html=True)
+                    new_nro = st.text_input(f"enro_{fid}", value=f["nro_factura"] or "", placeholder="FC 00000-00000000", label_visibility="collapsed")
+                with eb:
+                    st.markdown('<p class="lbl">Obra Social</p>', unsafe_allow_html=True)
+                    os_edit_opts = [f["obra_social"]] + [o for o in [o["nombre"] for o in OBRAS_SOCIALES] if o != f["obra_social"]]
+                    new_os = st.selectbox(f"eos_{fid}", os_edit_opts, label_visibility="collapsed")
+                with ec:
+                    st.markdown('<p class="lbl">Período</p>', unsafe_allow_html=True)
+                    new_per = st.text_input(f"eper_{fid}", value=f["periodo"] or "", placeholder="Mayo 2026", label_visibility="collapsed")
+                with ed:
+                    st.markdown('<p class="lbl">&nbsp;</p>', unsafe_allow_html=True)
+                    if st.button("Guardar", key=f"esave_{fid}", type="primary", use_container_width=True):
+                        editar_factura(fid, new_nro, new_os, new_per)
+                        st.session_state[edit_fac_key] = False
+                        st.success("Factura actualizada.")
+                        st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── Confirmación eliminación ──────────────────────────────────────
+        if st.session_state.get(confirm_del_key, False):
+            st.warning(
+                f"⚠ ¿Eliminar **{nro}** ({f['obra_social']} · {f['periodo']})? "
+                f"Se borrarán {total} profesionales y todos sus comprobantes.",
+            )
+            dc1, dc2, _ = st.columns([1, 1, 4])
+            with dc1:
+                if st.button("Sí, eliminar", key=f"dconfirm_{fid}", type="primary", use_container_width=True):
+                    eliminar_factura(fid)
+                    st.session_state.pop(confirm_del_key, None)
+                    st.success("Factura eliminada.")
+                    st.rerun()
+            with dc2:
+                if st.button("Cancelar", key=f"dcancel_{fid}", use_container_width=True):
+                    st.session_state[confirm_del_key] = False
+                    st.rerun()
 
 
 # ─────────────────────────────────────────────
@@ -763,7 +913,7 @@ def pantalla_detalle(factura_id, user):
             f"**{prof}** · {linea['matricula']} · "
             f"$ {float(linea['total_cobrar'] or 0):,.2f}  "
             f"{'✓' if est_actual=='Completo' else ''}",
-            expanded=True,
+            expanded=False,
         ):
             # ── Datos del profesional en esta factura ─────────────────
             st.markdown('<div class="section-title">Importes en esta factura</div>', unsafe_allow_html=True)
