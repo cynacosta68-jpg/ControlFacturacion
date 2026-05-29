@@ -392,6 +392,74 @@ def upsert_comprobante(detalle_id: int, nro_arca: str, estado: str):
                               updated_at=NOW()
             """, (detalle_id, nro_arca, estado))
 
+def eliminar_comprobante(detalle_id: int):
+    """Resetea el comprobante a vacío / Pendiente (no elimina la fila del detalle)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO comprobantes(detalle_id, nro_arca, estado, updated_at)
+                VALUES(%s,'','Pendiente',NOW())
+                ON CONFLICT(detalle_id)
+                DO UPDATE SET nro_arca='', estado='Pendiente', updated_at=NOW()
+            """, (detalle_id,))
+
+def exportar_excel_factura(factura_id: int) -> bytes:
+    """Genera Excel con detalle + estado de comprobantes."""
+    filas = obtener_detalle(factura_id)
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT nro_factura, obra_social, periodo FROM facturas WHERE id=%s", (factura_id,))
+            fac = cur.fetchone()
+    rows = []
+    for r in filas:
+        rows.append({
+            "Profesional":    r["profesional"],
+            "Matrícula":      r["matricula"],
+            "Nro Socio":      r["nro_socio"],
+            "Resp. Fiscal":   r["resp_fiscal"],
+            "Exento":         r["exento"],
+            "Gravado":        r["gravado"],
+            "Facturado":      r["facturado"],
+            "IVA":            r["iva"],
+            "Debitado":       r["debitado"],
+            "Total a Cobrar": r["total_cobrar"],
+            "Honorarios":     r["honorarios"],
+            "Gastos":         r["gastos"],
+            "Coseguro":       r["coseguro"],
+            "Nro ARCA":       r["nro_arca"],
+            "Estado":         r["estado"],
+        })
+    df = pd.DataFrame(rows)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Detalle")
+    return buf.getvalue(), fac
+
+def exportar_excel_resumen(obra_social=None, periodo=None) -> bytes:
+    """Genera Excel resumen de todas las facturas filtradas."""
+    facturas = obtener_facturas(obra_social=obra_social, periodo=periodo, limit=None)
+    rows = []
+    for f in facturas:
+        filas = obtener_detalle(f["id"])
+        for r in filas:
+            rows.append({
+                "Nro Factura":    f["nro_factura"],
+                "Obra Social":    f["obra_social"],
+                "Período":        f["periodo"],
+                "Profesional":    r["profesional"],
+                "Matrícula":      r["matricula"],
+                "Facturado":      r["facturado"],
+                "IVA":            r["iva"],
+                "Total a Cobrar": r["total_cobrar"],
+                "Nro ARCA":       r["nro_arca"],
+                "Estado":         r["estado"],
+            })
+    df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Resumen")
+    return buf.getvalue()
+
 def importar_excel(df, obra_social, periodo, archivo_nombre, user, obra_cuit="", nro_factura=""):
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -530,6 +598,22 @@ def pantalla_resumen(user):
         limit=limit if limit else None,
     )
 
+    # ── Descarga resumen Excel ────────────────────────────────────────────
+    col_dl, _ = st.columns([2, 5])
+    with col_dl:
+        if st.button("Descargar Excel del resumen", use_container_width=True):
+            excel = exportar_excel_resumen(
+                obra_social=None if os_sel=="Todas" else os_sel,
+                periodo=None if per_sel=="Todos" else per_sel,
+            )
+            st.download_button(
+                "📥 Confirmar descarga",
+                data=excel,
+                file_name=f"resumen_facturacion.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
     st.markdown("---")
 
     if not facturas:
@@ -624,16 +708,52 @@ def pantalla_detalle(factura_id, user):
     m2.metric("Total a Cobrar", f"$ {total_monto:,.2f}")
     m3.metric("Comprobantes completos", f"{compl_prof}/{total_prof}")
     barra_progreso(compl_prof, total_prof)
+
+    # ── Descarga Excel detalle ────────────────────────────────────────────
+    excel_bytes, fac_info = exportar_excel_factura(factura_id)
+    nro_dl = (fac_info["nro_factura"] or f"ID{factura_id}").replace(" ","_")
+    st.download_button(
+        "📥 Descargar Excel de esta factura",
+        data=excel_bytes,
+        file_name=f"detalle_{nro_dl}_{fac_info['obra_social'].replace(' ','_')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=False,
+    )
+
     st.markdown("---")
 
     if not filas:
         st.info("Esta factura no tiene detalle.")
         return
 
-    st.markdown('<div class="section-title">Profesionales — click para gestionar comprobante</div>',
+    st.markdown('<div class="section-title">Profesionales — gestionar comprobante</div>',
                 unsafe_allow_html=True)
 
-    for linea in filas:
+    # ── Buscador ─────────────────────────────────────────────────────────
+    st.markdown('<p class="lbl">Buscar por profesional o matrícula</p>', unsafe_allow_html=True)
+    busqueda = st.text_input(
+        "busq_prof", placeholder="Ej: GARCIA o C1059",
+        label_visibility="collapsed", key="busq_detalle"
+    ).strip().lower()
+
+    filas_filtradas = filas
+    if busqueda:
+        filas_filtradas = [
+            r for r in filas
+            if busqueda in (r["profesional"] or "").lower()
+            or busqueda in (r["matricula"] or "").lower()
+        ]
+        if not filas_filtradas:
+            st.caption(f"Sin resultados para '{busqueda}'")
+            return
+
+    st.markdown(
+        f'<div style="font-size:.72rem;color:#484f58;margin-bottom:8px">'
+        f'Mostrando {len(filas_filtradas)} de {len(filas)} profesionales</div>',
+        unsafe_allow_html=True,
+    )
+
+    for linea in filas_filtradas:
         lid        = linea["id"]
         prof       = linea["profesional"]
         nro_actual = linea["nro_arca"] or ""
@@ -643,7 +763,7 @@ def pantalla_detalle(factura_id, user):
             f"**{prof}** · {linea['matricula']} · "
             f"$ {float(linea['total_cobrar'] or 0):,.2f}  "
             f"{'✓' if est_actual=='Completo' else ''}",
-            expanded=(est_actual != "Completo"),
+            expanded=True,
         ):
             # ── Datos del profesional en esta factura ─────────────────
             st.markdown('<div class="section-title">Importes en esta factura</div>', unsafe_allow_html=True)
@@ -655,43 +775,76 @@ def pantalla_detalle(factura_id, user):
 
             st.markdown("---")
 
-            # ── Comprobante ARCA de esta factura ──────────────────────
+            # ── Comprobante ARCA ──────────────────────────────────────
             st.markdown('<div class="section-title">Comprobante del profesional · esta factura</div>',
                         unsafe_allow_html=True)
-            ca, cb, cc = st.columns([3, 2, 1])
-            with ca:
-                st.markdown('<p class="lbl">Número ARCA (A-00000-00000000)</p>', unsafe_allow_html=True)
-                nuevo_nro = st.text_input(
-                    f"nro_{lid}", value=nro_actual,
-                    placeholder="A-00000-00000000",
-                    label_visibility="collapsed",
-                    key=f"inp_nro_{lid}",
-                )
-            with cb:
-                st.markdown('<p class="lbl">Estado</p>', unsafe_allow_html=True)
-                # Auto-completa estado según formato
-                if nuevo_nro.strip() and ARCA_RE.match(nuevo_nro.strip()):
-                    idx_default = 2  # Completo
-                else:
-                    opts = ["Pendiente","Solicitada","Completo"]
-                    idx_default = opts.index(est_actual) if est_actual in opts else 0
-                nuevo_estado = st.selectbox(
-                    f"est_{lid}",
-                    ["Pendiente","Solicitada","Completo"],
-                    index=idx_default,
-                    label_visibility="collapsed",
-                    key=f"sel_est_{lid}",
-                )
-                st.markdown(badge(nuevo_estado), unsafe_allow_html=True)
-            with cc:
-                st.markdown('<p class="lbl">&nbsp;</p>', unsafe_allow_html=True)
-                if st.button("Guardar", key=f"save_{lid}", type="primary", use_container_width=True):
-                    nro_clean = nuevo_nro.strip()
-                    if nro_clean and not ARCA_RE.match(nro_clean):
-                        st.error(f"Formato inválido. Debe ser A-00000-00000000")
+
+            # Estado de edición por línea
+            edit_key = f"edit_{lid}"
+            if edit_key not in st.session_state:
+                st.session_state[edit_key] = False
+
+            if not st.session_state[edit_key] and nro_actual:
+                # ── Modo lectura: mostrar datos + botones Modificar / Eliminar ──
+                ca, cb, cc, cd = st.columns([3, 2, 1, 1])
+                with ca:
+                    st.markdown(f'<p class="lbl">Nro ARCA</p>'
+                                f'<div style="font-family:JetBrains Mono;font-size:.85rem;color:#f0f6fc">'
+                                f'{nro_actual}</div>', unsafe_allow_html=True)
+                with cb:
+                    st.markdown(f'<p class="lbl">Estado</p>', unsafe_allow_html=True)
+                    st.markdown(badge(est_actual), unsafe_allow_html=True)
+                with cc:
+                    st.markdown('<p class="lbl">&nbsp;</p>', unsafe_allow_html=True)
+                    if st.button("✏ Modificar", key=f"mod_{lid}", use_container_width=True):
+                        st.session_state[edit_key] = True
+                        st.rerun()
+                with cd:
+                    st.markdown('<p class="lbl">&nbsp;</p>', unsafe_allow_html=True)
+                    if st.button("🗑 Eliminar", key=f"del_{lid}", use_container_width=True):
+                        eliminar_comprobante(lid)
+                        st.session_state.pop(edit_key, None)
+                        st.success(f"Comprobante de {prof} eliminado.")
+                        st.rerun()
+            else:
+                # ── Modo edición: campos + guardar / cancelar ──────────────
+                ca, cb, cc, cd = st.columns([3, 2, 1, 1])
+                with ca:
+                    st.markdown('<p class="lbl">Número ARCA (A-00000-00000000)</p>', unsafe_allow_html=True)
+                    nuevo_nro = st.text_input(
+                        f"nro_{lid}", value=nro_actual,
+                        placeholder="A-00000-00000000",
+                        label_visibility="collapsed",
+                        key=f"inp_nro_{lid}",
+                    )
+                with cb:
+                    st.markdown('<p class="lbl">Estado</p>', unsafe_allow_html=True)
+                    if nuevo_nro.strip() and ARCA_RE.match(nuevo_nro.strip()):
+                        idx_default = 2
                     else:
-                        upsert_comprobante(lid, nro_clean, nuevo_estado)
-                        st.success("Guardado ✓")
+                        opts = ["Pendiente","Solicitada","Completo"]
+                        idx_default = opts.index(est_actual) if est_actual in opts else 0
+                    nuevo_estado = st.selectbox(
+                        f"est_{lid}", ["Pendiente","Solicitada","Completo"],
+                        index=idx_default, label_visibility="collapsed",
+                        key=f"sel_est_{lid}",
+                    )
+                    st.markdown(badge(nuevo_estado), unsafe_allow_html=True)
+                with cc:
+                    st.markdown('<p class="lbl">&nbsp;</p>', unsafe_allow_html=True)
+                    if st.button("💾 Guardar", key=f"save_{lid}", type="primary", use_container_width=True):
+                        nro_clean = nuevo_nro.strip()
+                        if nro_clean and not ARCA_RE.match(nro_clean):
+                            st.error("Formato inválido. Debe ser A-00000-00000000")
+                        else:
+                            upsert_comprobante(lid, nro_clean, nuevo_estado)
+                            st.session_state[edit_key] = False
+                            st.success("Guardado ✓")
+                            st.rerun()
+                with cd:
+                    st.markdown('<p class="lbl">&nbsp;</p>', unsafe_allow_html=True)
+                    if st.button("✕ Cancelar", key=f"can_{lid}", use_container_width=True):
+                        st.session_state[edit_key] = False
                         st.rerun()
 
             # ── Otras facturas del mismo profesional ──────────────────
